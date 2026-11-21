@@ -152,6 +152,167 @@ pub fn place_bitmap(doc: &mut AniDoc, name: &str, size: [f64; 2]) -> Result<(), 
     Ok(())
 }
 
+/// The result of importing from another document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportedDocument {
+    /// The new library names of the imported symbols, in the order they were requested.
+    pub symbols: Vec<String>,
+}
+
+/// Imports symbols (with their nested dependencies) from another `.fla` or XFL document into the library.
+///
+/// Copies the requested symbols plus every symbol, bitmap and sound they reference, recursively. Names that are taken
+/// in this library get a free variant (`name 2`, ...) and the references inside the copied timelines are rewritten to
+/// match. Bitmap and sound bytes are copied into this session's media store. Folders are preserved. Fonts are not
+/// copied; text keeps its font face name and renders with this document's fonts.
+///
+/// # Errors
+/// A message for unreadable documents, unknown symbol names or a media store over its size cap.
+pub fn import_from_document(doc: &mut AniDoc, path: &Path, symbols: &[String], place_first: bool) -> Result<ImportedDocument, String> {
+    let source = anicraft_xfl::read_with(path, &anicraft_xfl::ReadOptions::default()).map_err(|e| e.to_string())?;
+    let mut wanted: Vec<anim_scene::LibraryItem> = Vec::new();
+    let mut queue: Vec<String> = Vec::new();
+    for name in symbols {
+        let item = source.document.library.find(name).ok_or_else(|| format!("{path:?}: no library item named {name:?}"))?;
+        queue.push(item.name().to_owned());
+    }
+    let mut seen: Vec<String> = Vec::new();
+    while let Some(name) = queue.pop() {
+        if seen.contains(&name) {
+            continue;
+        }
+        seen.push(name.clone());
+        let item = source.document.library.find(&name).ok_or_else(|| format!("{path:?}: missing library item {name:?} referenced by the import"))?;
+        if let anim_scene::LibraryItem::Folder(_) = item {
+            continue;
+        }
+        wanted.push(item.clone());
+        collect_references(&item, &mut queue);
+    }
+    let mut renames: Vec<(String, String)> = Vec::new();
+    for item in &wanted {
+        let new_name = free_name(doc.document(), item.name());
+        renames.push((item.name().to_owned(), new_name));
+    }
+    for (item, (_, new_name)) in wanted.into_iter().zip(renames.iter().cloned()) {
+        let mut new_item = item;
+        match &mut new_item {
+            anim_scene::LibraryItem::Symbol(s) => {
+                s.name = new_name;
+                s.item_id = doc.document().library.fresh_item_id(&s.name);
+                s.href = None;
+                s.include_attrs.clear();
+                rewrite_timeline(&mut s.timeline, &renames);
+            }
+            anim_scene::LibraryItem::Bitmap(b) => {
+                b.name = new_name.clone();
+                b.item_id = doc.document().library.fresh_item_id(&new_name);
+                if let Some(media) = b.media {
+                    let bytes = source.media.get(media).ok_or_else(|| format!("{path:?}: bitmap {new_name:?} has no loaded media"))?.to_vec();
+                    b.media = Some(doc.media.insert(bytes).map_err(|e| format!("{e} (importing bitmap {new_name:?})"))?);
+                }
+            }
+            anim_scene::LibraryItem::Sound(s) => {
+                s.name = new_name.clone();
+                s.item_id = doc.document().library.fresh_item_id(&new_name);
+                if let Some(media) = s.media {
+                    let bytes = source.media.get(media).ok_or_else(|| format!("{path:?}: sound {new_name:?} has no loaded media"))?.to_vec();
+                    s.media = Some(doc.media.insert(bytes).map_err(|e| format!("{e} (importing sound {new_name:?})"))?);
+                }
+            }
+            anim_scene::LibraryItem::Font(f) => {
+                f.name = new_name;
+                f.item_id = doc.document().library.fresh_item_id(&f.name);
+            }
+            anim_scene::LibraryItem::Video(v) => {
+                v.name = new_name.clone();
+                v.item_id = doc.document().library.fresh_item_id(&new_name);
+                if let Some(media) = v.media {
+                    let bytes = source.media.get(media).ok_or_else(|| format!("{path:?}: video {new_name:?} has no loaded media"))?.to_vec();
+                    v.media = Some(doc.media.insert(bytes).map_err(|e| format!("{e} (importing video {new_name:?})"))?);
+                }
+            }
+            anim_scene::LibraryItem::Folder(_) => {}
+        }
+        doc.editor.document.library.push(new_item).map_err(|e| e.to_string())?;
+    }
+    if place_first {
+        if let Some((_, new_name)) = renames.first() {
+            let (w, h) = (doc.document().width, doc.document().height);
+            // Centre the artwork's bounds, not the symbol's origin: the art may sit far from (0, 0).
+            let offset = match doc.document().library.find_symbol(new_name) {
+                Some(s) => anim_scene::bounds::timeline_bounds(&s.timeline, 0, &doc.document().library)
+                    .map_or((0.0, 0.0), |b| (w / 2.0 - (b.x0 + b.width() / 2.0), h / 2.0 - (b.y0 + b.height() / 2.0))),
+                None => {
+                    let size = doc.document().library.find_bitmap(new_name).and_then(|b| b.size).unwrap_or([w, h]);
+                    ((w - size[0]) / 2.0, (h - size[1]) / 2.0)
+                }
+            };
+            let id = doc.editor.state.timeline.clone();
+            let (layer, frame) = (doc.editor.state.layer, doc.editor.state.frame);
+            let matrix = Affine::translate(offset);
+            let at = anim_scene::edit::add_element(&mut doc.editor.document, &id, layer, frame,
+                Element::SymbolInstance(Box::new(anim_scene::SymbolInstance::new(new_name, matrix)))).map_err(|e| e.to_string())?;
+            let keyframe = doc.document().timeline(&id).and_then(|t| t.layers.get(layer)).and_then(|l| l.keyframe_at(frame)).map_or(0, |k| k.index);
+            doc.editor.state.selection = anicraft_tools::Selection::one(anicraft_tools::ElementRef::top_level(layer, keyframe, at));
+        }
+    }
+    Ok(ImportedDocument { symbols: renames.iter().map(|(_, new)| new.clone()).collect() })
+}
+
+/// Queues every library reference inside `item` (nested symbols, placed bitmaps, sounds).
+fn collect_references(item: &anim_scene::LibraryItem, queue: &mut Vec<String>) {
+    if let anim_scene::LibraryItem::Symbol(s) = item {
+        for frame in s.timeline.layers.iter().flat_map(|l| &l.frames) {
+            for element in &frame.elements {
+                collect_element(element, queue);
+            }
+        }
+    }
+}
+
+fn collect_element(element: &Element, queue: &mut Vec<String>) {
+    match element {
+        Element::SymbolInstance(i) => queue.push(i.library_item_name.clone()),
+        Element::Bitmap(b) => queue.push(b.library_item_name.clone()),
+        Element::Group(g) => {
+            for member in &g.members {
+                collect_element(member, queue);
+            }
+        }
+        Element::Shape(_) | Element::Text(_) | Element::Unknown(_) => {}
+    }
+}
+
+/// Rewrites every `library_item_name` inside `timeline` through `renames`.
+fn rewrite_timeline(timeline: &mut anim_scene::Timeline, renames: &[(String, String)]) {
+    for layer in &mut timeline.layers {
+        for frame in &mut layer.frames {
+            for element in &mut frame.elements {
+                rewrite_element(element, renames);
+            }
+        }
+    }
+}
+
+fn rewrite_element(element: &mut Element, renames: &[(String, String)]) {
+    let renamed = |name: &str| -> String {
+        renames.iter().rev().find(|(old, _)| old == name).map_or_else(|| name.to_owned(), |(_, new)| new.clone())
+    };
+    match element {
+        Element::SymbolInstance(i) => i.library_item_name = renamed(&i.library_item_name),
+        Element::Bitmap(b) => b.library_item_name = renamed(&b.library_item_name),
+        Element::Group(g) => {
+            for member in &mut g.members {
+                rewrite_element(member, renames);
+            }
+        }
+        Element::Shape(_) | Element::Text(_) | Element::Unknown(_) => {}
+    }
+}
+ 
+ /// Puts a bitmap instance centred on the stage on the current layer and frame.
+
 #[cfg(test)]
 mod tests {
     use super::*;

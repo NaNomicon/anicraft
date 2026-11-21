@@ -87,6 +87,10 @@ fn menu_commands() -> Vec<CommandSpec<AniDoc>> {
             .in_menu(&["File", "Import"])
             .describe("Imports an image into the library: PNG, JPEG, GIF, BMP and WebP as they are; PSD, AI, PDF and SVG flattened to a PNG at their own size. WAV, MP3, Ogg and FLAC sounds go to the library only (a WAV is stored as Animate stores it: 16 bit PCM at 5, 11, 22 or 44 kHz); put one on a keyframe with timeline_set_sound. `name` overrides the library name. With `place` the bitmap is also put, centred, on the current layer and frame of the timeline being edited. The path must lie inside a read root.")
             .with_schema(r#"{"type":"object","additionalProperties":false,"required":["path"],"properties":{"path":{"type":"string","description":"file to import"},"name":{"type":"string"},"place":{"type":"boolean","default":false}}}"#),
+        CommandSpec::new("library.import_document", "Import from Document...", import_document)
+            .in_menu(&["File", "Import"])
+            .describe("Imports symbols from another .fla or XFL document: the named symbols plus every symbol, bitmap and sound they reference, recursively. Name clashes get a free variant (`name 2`) and references inside the copied timelines are rewritten. Bitmap, sound and video bytes are copied into this session. With `place` the first symbol is put, centred, on the current layer and frame. The path must lie inside a read root.")
+            .with_schema(r#"{"type":"object","additionalProperties":false,"required":["path","symbols"],"properties":{"path":{"type":"string","description":".fla or XFL document to import from"},"symbols":{"type":"array","items":{"type":"string"},"description":"library names to import"},"place":{"type":"boolean","default":false}}}"#),
     ]
 }
 
@@ -374,6 +378,23 @@ fn import(doc: &mut AniDoc, params: &Value) -> Out {
     }
     Ok(json!({ "name": imported.name, "kind": "bitmap", "width": imported.size[0], "height": imported.size[1], "placed": p.place }))
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportDocumentParams {
+    path: String,
+    /// Library names to import; their nested dependencies come along.
+    symbols: Vec<String>,
+    #[serde(default)]
+    place: bool,
+}
+
+fn import_document(doc: &mut AniDoc, params: &Value) -> Out {
+    let p: ImportDocumentParams = parse_params(params)?;
+    let imported = crate::import::import_from_document(doc, Path::new(&p.path), &p.symbols, p.place).map_err(CommandError::failed)?;
+    Ok(json!({ "symbols": imported.symbols, "placed": p.place }))
+}
+
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Instance commands
