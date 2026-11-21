@@ -1,0 +1,56 @@
+name: macos-build
+
+# Dispatch-only macOS build of the app and CLI, artifacts only (no release).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (macos-${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+          - arch: x86_64
+            runner: macos-13
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup show
+      - run: rustup target add ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p anicraft -p anicraft-cli
+      - name: Package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          PKG="anicraft-dev-macos-${ARCH}"
+          BIN="target/${TARGET}/release"
+          mkdir -p dist "stage/${PKG}"
+          cp README.md LICENSE-MIT LICENSE-BSD-3-Clause "stage/${PKG}/"
+          APP="stage/${PKG}/AniCraft.app"
+          mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
+          cp "${BIN}/anicraft" "${APP}/Contents/MacOS/anicraft"
+          sed -e "s/@VERSION@/dev/g" packaging/macos/Info.plist > "${APP}/Contents/Info.plist"
+          cp "${BIN}/anicraft-cli" "stage/${PKG}/"
+          codesign --force --deep --sign - "${APP}" || true
+          (cd stage && ditto -c -k --keepParent "${PKG}" "../dist/${PKG}.zip")
+          ls -l dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
